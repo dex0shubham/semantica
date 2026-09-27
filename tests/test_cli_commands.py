@@ -15,6 +15,7 @@ Strategy:
 
 import json
 import os
+import time
 import re
 import stat
 import types
@@ -1888,6 +1889,76 @@ class TestMemoryGraphBackend:
     def test_graph_path_is_configurable(self, memory_cfg, tmp_path):
         ctx = self._ctx(memory_cfg)
         assert cli_module._memory_graph_path(ctx) == tmp_path / "graph.json"
+
+    def test_validity_flags_reach_the_graph_not_just_metadata(
+        self, runner, memory_cfg, tmp_path
+    ):
+        """ContextGraph tracks node validity itself (Qodo #2 on PR #1765).
+
+        Passing --valid-from/--valid-until only inside metadata left the
+        decision active outside its window.
+        """
+        result = runner.invoke(cli_module.main, [
+            "--config", memory_cfg, "decision", "record", "--title", "Trial run",
+            "--tags", "pilot", "--rationale", "time-boxed",
+            "--valid-from", "2026-01-01T00:00:00",
+            "--valid-until", "2026-02-01T00:00:00",
+        ])
+        _ok(result)
+        saved = json.loads((tmp_path / "graph.json").read_text())
+        blob = json.dumps(saved)
+        assert "2026-01-01" in blob and "2026-02-01" in blob
+
+    def test_check_sees_the_stored_reasoning_and_decision_maker(
+        self, runner, memory_cfg
+    ):
+        """check_decision_rules indexes decision["reasoning"] (Qodo #4).
+
+        The display mapping used by list/query omits it, so policy checks were
+        evaluating a decision that looked emptier than what was stored.
+        """
+        self._record(runner, memory_cfg, "Adopt Postgres", "database",
+                     "cheaper to operate")
+        ctx = self._ctx(memory_cfg)
+        stored = cli_module._memory_decisions(ctx)
+        assert stored, "nothing recorded"
+        assert stored[0]["reasoning"] == "cheaper to operate"
+        assert "decision_maker" in stored[0]
+
+    def test_concurrent_records_do_not_lose_each_other(self, memory_cfg, tmp_path):
+        """Two processes recording at once must not drop a decision (Qodo #1).
+
+        record is a load-modify-save of the whole graph, so without a lock the
+        later save replaces the earlier decision, silently.
+        """
+        import subprocess
+        import sys as _sys
+
+        procs = [
+            subprocess.Popen(
+                [_sys.executable, "-m", "semantica.cli", "--config", memory_cfg,
+                 "decision", "record", "--title", f"Decision {i}",
+                 "--tags", f"tag{i}", "--rationale", "concurrent"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+            for i in range(4)
+        ]
+        assert all(p.wait(timeout=120) == 0 for p in procs)
+
+        ctx = self._ctx(memory_cfg)
+        titles = {d["scenario"] for d in cli_module._memory_decisions(ctx)}
+        assert titles == {f"Decision {i}" for i in range(4)}, titles
+
+    def test_stale_lock_is_reclaimed(self, memory_cfg, tmp_path, monkeypatch):
+        """A lock left by a killed process must not wedge the CLI forever."""
+        lock = (tmp_path / "graph.json").with_suffix(".lock")
+        lock.write_text("")
+        old = time.time() - (cli_module._LOCK_STALE_SECONDS + 5)
+        os.utime(lock, (old, old))
+        ctx = self._ctx(memory_cfg)
+        with cli_module._memory_graph_lock(ctx):
+            pass
+        assert not lock.exists()
 
     def test_get_graph_store_refuses_memory_with_a_clear_message(self, memory_cfg):
         """Safety net: a future caller that forgets to route memory gets told."""

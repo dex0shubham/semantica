@@ -6,6 +6,7 @@ enabling users to interact with the framework via terminal commands.
 """
 
 import json
+import contextlib
 import os
 import re
 import sys
@@ -23,7 +24,8 @@ if sys.platform == "win32":
 from dataclasses import asdict, dataclass, field, is_dataclass
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import (TYPE_CHECKING, Any, Callable, Dict, Iterator, List,
+                    Optional, Sequence, Tuple)
 
 import yaml
 
@@ -1230,6 +1232,8 @@ def build_alias(
 
 MEMORY_GRAPH_BACKEND = "memory"
 _NO_RATIONALE = "(no rationale provided)"
+_LOCK_TIMEOUT_SECONDS = 10.0
+_LOCK_STALE_SECONDS = 60.0
 _DEFAULT_GRAPH_BACKEND = "neo4j"
 
 
@@ -1293,6 +1297,49 @@ def _save_context_graph(cli_ctx: CLIContext, graph: Any) -> None:
     graph.save_to_file(path)
 
 
+@contextlib.contextmanager
+def _memory_graph_lock(cli_ctx: CLIContext) -> "Iterator[None]":
+    """Serialise read-modify-write of the memory graph across CLI processes.
+
+    ``decision record`` loads the whole graph, adds a node and writes it back.
+    Two invocations that load before either saves would silently lose the
+    earlier decision — ``save_to_file`` replaces the file atomically, so the
+    write is never torn, but the lost update is invisible.
+
+    Uses the ``O_CREAT | O_EXCL`` atomic-create idiom already used for the
+    extraction cache, which needs no third-party dependency and behaves the
+    same on Windows. A lock older than ``_LOCK_STALE_SECONDS`` is treated as
+    abandoned by a killed process and reclaimed, so a crash cannot wedge the
+    CLI permanently.
+    """
+    lock_path = _memory_graph_path(cli_ctx).with_suffix(".lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    deadline = time.monotonic() + _LOCK_TIMEOUT_SECONDS
+    while True:
+        try:
+            fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            break
+        except FileExistsError:
+            try:
+                age = time.time() - lock_path.stat().st_mtime
+            except FileNotFoundError:
+                continue  # released between the open and the stat; retry
+            if age > _LOCK_STALE_SECONDS:
+                lock_path.unlink(missing_ok=True)
+                continue
+            if time.monotonic() >= deadline:
+                raise click.ClickException(
+                    f"Timed out waiting for {lock_path}. If no other semantica "
+                    f"command is running, delete that file."
+                )
+            time.sleep(0.05)
+    try:
+        yield
+    finally:
+        os.close(fd)
+        lock_path.unlink(missing_ok=True)
+
+
 def _decision_from_node(node: Dict[str, Any]) -> Dict[str, Any]:
     """Normalise a ContextGraph decision node to the CLI's decision shape.
 
@@ -1301,15 +1348,25 @@ def _decision_from_node(node: Dict[str, Any]) -> Dict[str, Any]:
     so both backends print identically.
     """
     meta = node.get("metadata", {}) or {}
-    return {
+    # Carry every stored field, not just the ones the tables print:
+    # check_decision_rules() indexes decision["reasoning"] and reads
+    # decision_maker, valid_from/valid_until and nested metadata.
+    decision = {
         "id": node.get("id", ""),
+        "decision_id": node.get("id", ""),
         "scenario": meta.get("scenario", node.get("content", "")),
         "category": meta.get("category", ""),
         "outcome": meta.get("outcome", ""),
         "confidence": meta.get("confidence", 0.0),
         "timestamp": meta.get("timestamp", 0.0),
         "recorded_at": meta.get("recorded_at", ""),
+        "reasoning": meta.get("reasoning", ""),
+        "decision_maker": meta.get("decision_maker") or "",
     }
+    for key in ("valid_from", "valid_until", "metadata"):
+        if key in meta:
+            decision[key] = meta[key]
+    return decision
 
 
 def _memory_decisions(cli_ctx: CLIContext, limit: Optional[int] = None) -> List[Dict[str, Any]]:
@@ -3269,16 +3326,30 @@ def decision_record(cli_ctx: CLIContext, title: str, tags: Optional[str],
             # one storing "" and the other refusing the command.
             reasoning = rationale or _NO_RATIONALE
             if _uses_memory_graph(cli_ctx):
-                graph = _load_context_graph(cli_ctx)
-                result = graph.record_decision(
-                    category=category,
-                    scenario=title,
-                    reasoning=reasoning,
-                    outcome="recorded",
-                    confidence=1.0,
-                    metadata=cross_ctx,
-                )
-                _save_context_graph(cli_ctx, graph)
+                with _memory_graph_lock(cli_ctx):
+                    graph = _load_context_graph(cli_ctx)
+                    result = graph.record_decision(
+                        category=category,
+                        scenario=title,
+                        reasoning=reasoning,
+                        outcome="recorded",
+                        confidence=1.0,
+                        # ContextGraph tracks node validity itself, so pass the
+                        # dates as validity rather than leaving them in
+                        # metadata, where they would not bound the node.
+                        # They must also be REMOVED from the metadata: it is
+                        # splatted into add_node() alongside these arguments,
+                        # and a duplicate key raises a TypeError that
+                        # record_decision logs and swallows, leaving an empty
+                        # graph behind a successful exit code.
+                        metadata={
+                            k: v for k, v in cross_ctx.items()
+                            if k not in ("valid_from", "valid_until")
+                        },
+                        valid_from=valid_from,
+                        valid_until=valid_until,
+                    )
+                    _save_context_graph(cli_ctx, graph)
             else:
                 result = record_decision(
                     _get_graph_store(cli_ctx),
