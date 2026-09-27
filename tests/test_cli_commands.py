@@ -1770,6 +1770,133 @@ class TestDecision:
         assert result.exit_code != 0
 
 
+class TestMemoryGraphBackend:
+    """The `memory` backend routes through ContextGraph instead of GraphStore.
+
+    GraphStore has no `memory` backend, so before #1481 every one of these
+    commands died with `ValidationError: Unknown backend: memory` — which is
+    what `semantica init` writes by default.
+    """
+
+    @pytest.fixture
+    def memory_cfg(self, tmp_path):
+        cfg = tmp_path / "cfg.yaml"
+        cfg.write_text(
+            "graph_db:\n"
+            "  backend: memory\n"
+            f"  path: {tmp_path / 'graph.json'}\n"
+        )
+        return str(cfg)
+
+    def _record(self, runner, memory_cfg, title, tags, rationale=None):
+        args = ["--config", memory_cfg, "decision", "record", "--title", title,
+                "--tags", tags]
+        if rationale:
+            args += ["--rationale", rationale]
+        result = runner.invoke(cli_module.main, args)
+        _ok(result)
+        return result
+
+    def test_record_then_list_persists_across_invocations(self, runner, memory_cfg):
+        """A CLI is one process per command, so the graph must be written back."""
+        self._record(runner, memory_cfg, "Adopt Postgres", "database", "cheaper")
+        result = runner.invoke(
+            cli_module.main,
+            ["--config", memory_cfg, "decision", "list", "--format", "json"],
+        )
+        _ok(result)
+        rows = json.loads(result.output)
+        assert [r["title"] for r in rows] == ["Adopt Postgres"]
+        assert rows[0]["tags"] == ["database"]
+
+    def test_record_without_rationale_succeeds(self, runner, memory_cfg):
+        """--rationale is optional; ContextGraph rejects empty reasoning."""
+        self._record(runner, memory_cfg, "Use OAuth", "auth")
+        result = runner.invoke(
+            cli_module.main,
+            ["--config", memory_cfg, "decision", "list", "--format", "json"],
+        )
+        _ok(result)
+        assert [r["title"] for r in json.loads(result.output)] == ["Use OAuth"]
+
+    def test_query_filters_by_tag(self, runner, memory_cfg):
+        self._record(runner, memory_cfg, "Adopt Postgres", "database", "cheaper")
+        self._record(runner, memory_cfg, "Use OAuth", "auth", "standard")
+        result = runner.invoke(
+            cli_module.main,
+            ["--config", memory_cfg, "decision", "query", "--filter", "tag:database",
+             "--format", "json"],
+        )
+        _ok(result)
+        rows = json.loads(result.output)
+        assert [r["scenario"] for r in rows] == ["Adopt Postgres"]
+
+    def test_export_reads_the_context_graph(self, runner, memory_cfg):
+        self._record(runner, memory_cfg, "Adopt Postgres", "database", "cheaper")
+        result = runner.invoke(
+            cli_module.main, ["--config", memory_cfg, "export", "--format", "json"]
+        )
+        _ok(result)
+        payload = json.loads(result.output)
+        titles = [e.get("text") or e.get("name") for e in payload["entities"]]
+        assert "Adopt Postgres" in titles
+
+    def test_list_is_empty_before_anything_is_recorded(self, runner, memory_cfg):
+        """A missing graph file is an empty graph, not an error."""
+        result = runner.invoke(
+            cli_module.main,
+            ["--config", memory_cfg, "decision", "list", "--format", "json"],
+        )
+        _ok(result)
+        assert json.loads(result.output) == []
+
+    def test_check_names_the_decision_when_absent(self, runner, memory_cfg):
+        result = runner.invoke(
+            cli_module.main, ["--config", memory_cfg, "decision", "check", "nope"]
+        )
+        assert result.exit_code != 0
+        assert "nope" in result.output
+        assert "Traceback" not in result.output
+
+    def test_doctor_reports_memory_without_probing_a_server(self, runner, memory_cfg):
+        result = runner.invoke(cli_module.main, ["--config", memory_cfg, "doctor"])
+        graph_rows = [
+            line for line in result.output.splitlines() if "Graph store" in line
+        ]
+        assert graph_rows, result.output
+        assert "memory" in graph_rows[0]
+        assert "Neo4j" not in graph_rows[0]
+
+    def _ctx(self, memory_cfg, store_backend=None):
+        cfg = cli_module._build_runtime_config(memory_cfg, None)
+        return cli_module.CLIContext(
+            config_path=memory_cfg, config=cfg, log_level="INFO",
+            store_backend=store_backend,
+        )
+
+    def test_resolve_backend_reads_the_config(self, memory_cfg):
+        ctx = self._ctx(memory_cfg)
+        assert cli_module._resolve_graph_backend(ctx) == "memory"
+        assert cli_module._uses_memory_graph(ctx) is True
+
+    def test_resolve_backend_prefers_the_store_flag(self, memory_cfg):
+        """--store must win over the config file, as it does for every command."""
+        ctx = self._ctx(memory_cfg, store_backend="neo4j")
+        assert cli_module._resolve_graph_backend(ctx) == "neo4j"
+        assert cli_module._uses_memory_graph(ctx) is False
+
+    def test_graph_path_is_configurable(self, memory_cfg, tmp_path):
+        ctx = self._ctx(memory_cfg)
+        assert cli_module._memory_graph_path(ctx) == tmp_path / "graph.json"
+
+    def test_get_graph_store_refuses_memory_with_a_clear_message(self, memory_cfg):
+        """Safety net: a future caller that forgets to route memory gets told."""
+        import click as _click
+        with pytest.raises(_click.ClickException) as exc:
+            cli_module._get_graph_store(self._ctx(memory_cfg))
+        assert "ContextGraph" in str(exc.value)
+
+
 # ─── temporal ─────────────────────────────────────────────────────────────────
 
 

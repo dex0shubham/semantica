@@ -22,6 +22,7 @@ if sys.platform == "win32":
 
 from dataclasses import asdict, dataclass, field, is_dataclass
 from pathlib import Path, PurePosixPath, PureWindowsPath
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import yaml
@@ -516,9 +517,7 @@ def _show_startup(cli_ctx: CLIContext) -> None:
     if cli_ctx.quiet or cli_ctx.json_output:
         return
     cfg = cli_ctx.config.to_dict()
-    graph_store = (
-        cli_ctx.store_backend or cfg.get("graph_db", {}).get("backend", "neo4j")
-    )
+    graph_store = _resolve_graph_backend(cli_ctx)
     vector_store = (
         cli_ctx.vector_store_backend
         or cfg.get("vector_store", {}).get("backend", "faiss")
@@ -902,8 +901,14 @@ def doctor(cli_ctx: CLIContext, local_json: bool, deep_embeddings: bool) -> None
 
         # Graph store reachability
         def _graph() -> str:
-            cfg = cli_ctx.config.to_dict()
-            backend = cli_ctx.store_backend or cfg.get("graph_db", {}).get("backend", "neo4j")
+            backend = _resolve_graph_backend(cli_ctx)
+            if backend == MEMORY_GRAPH_BACKEND:
+                # No server to reach; prove the graph file is readable instead,
+                # which is the only way this backend can actually fail.
+                # Keep this short: the Note column truncates at 80 columns.
+                graph = _load_context_graph(cli_ctx)
+                count = len(graph.get_nodes_by_label("decision"))
+                return f"memory, {count} decision(s)"
             gs = _get_graph_store(cli_ctx)
             gs.ping() if hasattr(gs, "ping") else gs.connect()
             return f"{backend} reachable"
@@ -1223,13 +1228,158 @@ def build_alias(
 # ─── Graph store helper ──────────────────────────────────────────────────────
 
 
+MEMORY_GRAPH_BACKEND = "memory"
+_NO_RATIONALE = "(no rationale provided)"
+_DEFAULT_GRAPH_BACKEND = "neo4j"
+
+
+def _resolve_graph_backend(cli_ctx: CLIContext) -> str:
+    """Return the graph backend this invocation will actually use.
+
+    Single source of truth for the three places that used to resolve this
+    independently (status, ``doctor`` and ``_get_graph_store``) with two
+    different defaults — the inconsistency behind #1481.
+    """
+    graph_db = cli_ctx.config.to_dict().get("graph_db", {})
+    return cli_ctx.store_backend or graph_db.get(
+        "backend", _DEFAULT_GRAPH_BACKEND
+    )
+
+
+def _uses_memory_graph(cli_ctx: CLIContext) -> bool:
+    """True when decisions and exports are served by an in-process ContextGraph.
+
+    ``GraphStore`` has no ``memory`` backend — it supports neo4j, falkordb,
+    age and neptune — so ``memory`` is served by ``ContextGraph``, which
+    already works in memory and is what the Python quickstart uses.
+    """
+    return _resolve_graph_backend(cli_ctx) == MEMORY_GRAPH_BACKEND
+
+
+def _memory_graph_path(cli_ctx: CLIContext) -> Path:
+    """Where the memory backend's graph is persisted between invocations.
+
+    The CLI is one process per command, so an in-memory graph that is never
+    written back would make ``decision record`` pointless. Defaults to
+    ``~/.semantica/context_graph.json`` (beside ``config.yaml``); override with
+    ``graph_db.path`` in the config.
+    """
+    configured = cli_ctx.config.to_dict().get("graph_db", {}).get("path")
+    if configured:
+        return Path(configured).expanduser()
+    return Path.home() / ".semantica" / "context_graph.json"
+
+
+def _load_context_graph(cli_ctx: CLIContext) -> Any:
+    """Return the persisted ContextGraph, or an empty one if none exists yet."""
+    from .context import ContextGraph
+
+    graph = ContextGraph()
+    path = _memory_graph_path(cli_ctx)
+    if path.exists():
+        try:
+            graph.load_from_file(path)
+        except Exception as exc:
+            raise click.ClickException(
+                f"Could not read the graph at {path}: {exc}"
+            ) from exc
+    return graph
+
+
+def _save_context_graph(cli_ctx: CLIContext, graph: Any) -> None:
+    """Persist the ContextGraph so the next command sees this one's writes."""
+    path = _memory_graph_path(cli_ctx)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    graph.save_to_file(path)
+
+
+def _decision_from_node(node: Dict[str, Any]) -> Dict[str, Any]:
+    """Normalise a ContextGraph decision node to the CLI's decision shape.
+
+    Mirrors the fields the ``GraphStore`` path reads off a ``Decision``
+    (``decision_id``, ``scenario``, ``category``, ``outcome``, ``confidence``)
+    so both backends print identically.
+    """
+    meta = node.get("metadata", {}) or {}
+    return {
+        "id": node.get("id", ""),
+        "scenario": meta.get("scenario", node.get("content", "")),
+        "category": meta.get("category", ""),
+        "outcome": meta.get("outcome", ""),
+        "confidence": meta.get("confidence", 0.0),
+        "timestamp": meta.get("timestamp", 0.0),
+        "recorded_at": meta.get("recorded_at", ""),
+    }
+
+
+def _memory_decisions(cli_ctx: CLIContext, limit: Optional[int] = None) -> List[Dict[str, Any]]:
+    """Decisions from the memory backend, newest first."""
+    graph = _load_context_graph(cli_ctx)
+    decisions = [
+        _decision_from_node(n) for n in graph.get_nodes_by_label("decision")
+    ]
+    decisions.sort(key=lambda d: d.get("timestamp") or 0.0, reverse=True)
+    return decisions[:limit] if limit is not None else decisions
+
+
+def _memory_decision_records(
+    cli_ctx: CLIContext,
+    limit: Optional[int] = None,
+    since_ts: Optional[float] = None,
+) -> List[SimpleNamespace]:
+    """Memory-backend decisions as records with a ``Decision``-shaped surface.
+
+    The commands read ``.decision_id`` / ``.scenario`` / ``.category`` /
+    ``.outcome`` / ``.confidence`` off whatever the store returns, so matching
+    that surface lets both backends share one formatting path.
+    """
+    rows = [
+        d for d in _memory_decisions(cli_ctx)
+        if since_ts is None or (d.get("timestamp") or 0.0) >= since_ts
+    ]
+    if limit is not None:
+        rows = rows[:limit]
+    return [
+        SimpleNamespace(
+            decision_id=d["id"], scenario=d["scenario"], category=d["category"],
+            outcome=d["outcome"], confidence=d["confidence"],
+        )
+        for d in rows
+    ]
+
+
 def _get_graph_store(cli_ctx: CLIContext) -> Any:
     """Return a GraphStore instance wired from the current CLIContext config."""
     from .graph_store import GraphStore
     cfg = cli_ctx.config.to_dict()
     graph_db = dict(cfg.get("graph_db", {}))
-    backend = cli_ctx.store_backend or graph_db.pop("backend", "neo4j")
+    graph_db.pop("path", None)
+    backend = cli_ctx.store_backend or graph_db.pop("backend", _DEFAULT_GRAPH_BACKEND)
+    if backend == MEMORY_GRAPH_BACKEND:
+        # Reached only if a new caller forgets to route memory through
+        # ContextGraph; GraphStore would raise "Unknown backend: memory".
+        raise click.ClickException(
+            "The 'memory' backend is served by ContextGraph, not GraphStore — "
+            "this command has not been wired for it yet. Use --store neo4j "
+            "(or falkordb/age/neptune) for a real graph database."
+        )
     return GraphStore(backend=backend, **graph_db)
+
+
+def _load_policy_rules(path: str) -> Dict[str, Any]:
+    """Load a decision policy rules file as a mapping.
+
+    Distinct from ``_load_rule_definitions()``, which loads reasoning rules as a
+    list of strings. ``ContextGraph.check_decision_rules()`` takes a mapping of
+    policy constraints, so anything else is a usage error worth naming.
+    """
+    data = yaml.safe_load(Path(path).read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        raise click.ClickException(
+            f"Policy rules file '{path}' must be a YAML mapping of rules; "
+            f"got {type(data).__name__}."
+        )
+    return data
 
 
 def _load_rule_definitions(path: str) -> List[str]:
@@ -3106,7 +3256,6 @@ def decision_record(cli_ctx: CLIContext, title: str, tags: Optional[str],
             return
         try:
             from .context.decision_methods import record_decision
-            graph_store = _get_graph_store(cli_ctx)
             cross_ctx: Dict[str, Any] = {"tags": tag_list}
             if valid_from:
                 cross_ctx["valid_from"] = valid_from
@@ -3115,15 +3264,31 @@ def decision_record(cli_ctx: CLIContext, title: str, tags: Optional[str],
             # Map CLI flags to API: title→scenario, rationale→reasoning,
             # first tag (if any)→category, outcome and confidence use defaults.
             category = tag_list[0] if tag_list else "general"
-            result = record_decision(
-                graph_store,
-                category=category,
-                scenario=title,
-                reasoning=rationale or "",
-                outcome="recorded",
-                confidence=1.0,
-                cross_system_context=cross_ctx,
-            )
+            # --rationale is optional, but ContextGraph rejects empty reasoning.
+            # Normalise once so both backends store the same thing rather than
+            # one storing "" and the other refusing the command.
+            reasoning = rationale or _NO_RATIONALE
+            if _uses_memory_graph(cli_ctx):
+                graph = _load_context_graph(cli_ctx)
+                result = graph.record_decision(
+                    category=category,
+                    scenario=title,
+                    reasoning=reasoning,
+                    outcome="recorded",
+                    confidence=1.0,
+                    metadata=cross_ctx,
+                )
+                _save_context_graph(cli_ctx, graph)
+            else:
+                result = record_decision(
+                    _get_graph_store(cli_ctx),
+                    category=category,
+                    scenario=title,
+                    reasoning=reasoning,
+                    outcome="recorded",
+                    confidence=1.0,
+                    cross_system_context=cross_ctx,
+                )
         except ImportError as exc:
             raise click.ClickException(f"Context module not available: {exc}") from exc
         if _is_json(cli_ctx, local_json):
@@ -3145,13 +3310,16 @@ def decision_list(cli_ctx: CLIContext, limit: int, fmt: str, local_json: bool) -
 
     def _action() -> None:
         try:
-            from .context.decision_query import DecisionQuery
-            dq = DecisionQuery(_get_graph_store(cli_ctx))
-            results_raw = dq.find_by_time_range(
-                __import__("datetime").datetime.min,
-                __import__("datetime").datetime.now(),
-                limit=limit,
-            )
+            if _uses_memory_graph(cli_ctx):
+                results_raw = _memory_decision_records(cli_ctx, limit=limit)
+            else:
+                from .context.decision_query import DecisionQuery
+                dq = DecisionQuery(_get_graph_store(cli_ctx))
+                results_raw = dq.find_by_time_range(
+                    __import__("datetime").datetime.min,
+                    __import__("datetime").datetime.now(),
+                    limit=limit,
+                )
             results = [
                 {"id": d.decision_id, "title": d.scenario, "tags": [d.category]}
                 for d in (results_raw or [])
@@ -3198,11 +3366,17 @@ def decision_query(cli_ctx: CLIContext, filter_str: Optional[str],
 
     def _action() -> None:
         try:
-            from .context.decision_query import DecisionQuery
             import datetime as _dt
-            dq = DecisionQuery(_get_graph_store(cli_ctx))
             since_dt = _dt.datetime.fromisoformat(since) if since else _dt.datetime.min
-            raw = dq.find_by_time_range(since_dt, _dt.datetime.now(), limit=500)
+            if _uses_memory_graph(cli_ctx):
+                raw = _memory_decision_records(
+                    cli_ctx, limit=500,
+                    since_ts=since_dt.timestamp() if since else None,
+                )
+            else:
+                from .context.decision_query import DecisionQuery
+                dq = DecisionQuery(_get_graph_store(cli_ctx))
+                raw = dq.find_by_time_range(since_dt, _dt.datetime.now(), limit=500)
             results: List[Dict[str, Any]] = [
                 {"id": d.decision_id, "category": d.category, "scenario": d.scenario,
                  "outcome": d.outcome, "confidence": d.confidence}
@@ -3237,8 +3411,11 @@ def decision_trace(cli_ctx: CLIContext, decision_id: str, fmt: str, local_json: 
 
     def _action() -> None:
         try:
-            from .context.decision_methods import get_causal_chain
-            chain_raw = get_causal_chain(_get_graph_store(cli_ctx), decision_id)
+            if _uses_memory_graph(cli_ctx):
+                chain_raw = _load_context_graph(cli_ctx).get_causal_chain(decision_id)
+            else:
+                from .context.decision_methods import get_causal_chain
+                chain_raw = get_causal_chain(_get_graph_store(cli_ctx), decision_id)
             chain: Any = [
                 {"id": d.decision_id, "scenario": d.scenario, "outcome": d.outcome}
                 for d in chain_raw
@@ -3265,7 +3442,14 @@ def decision_similar(cli_ctx: CLIContext, decision_id: str, top_k: int, local_js
     def _action() -> None:
         try:
             from .context.decision_methods import find_precedents
-            raw = find_precedents(_get_graph_store(cli_ctx), decision_id, limit=top_k)
+            if _uses_memory_graph(cli_ctx):
+                raw = _load_context_graph(cli_ctx).find_precedents(
+                    decision_id, limit=top_k
+                )
+            else:
+                raw = find_precedents(
+                    _get_graph_store(cli_ctx), decision_id, limit=top_k
+                )
             results: List[Dict[str, Any]] = [
                 {"id": d.decision_id, "scenario": d.scenario, "category": d.category,
                  "confidence": d.confidence}
@@ -3292,7 +3476,14 @@ def decision_impact(cli_ctx: CLIContext, decision_id: str, local_json: bool) -> 
     def _action() -> None:
         try:
             from .context.decision_methods import analyze_decision_impact
-            result = analyze_decision_impact(_get_graph_store(cli_ctx), decision_id)
+            if _uses_memory_graph(cli_ctx):
+                result = _load_context_graph(cli_ctx).analyze_decision_impact(
+                    decision_id
+                )
+            else:
+                result = analyze_decision_impact(
+                    _get_graph_store(cli_ctx), decision_id
+                )
         except ImportError as exc:
             raise click.ClickException(f"Context module not available: {exc}") from exc
         if _is_json(cli_ctx, local_json):
@@ -3316,13 +3507,29 @@ def decision_check(cli_ctx: CLIContext, decision_id: str, rules: Optional[str],
 
     def _action() -> None:
         try:
-            from .context.decision_methods import check_decision_compliance
-            # The API expects a policy_id string; derive it from the rules file stem
-            # if provided, otherwise use the decision ID itself as the policy key.
-            policy_id = Path(rules).stem if rules else decision_id
-            result = check_decision_compliance(
-                _get_graph_store(cli_ctx), decision_id, policy_id
-            )
+            if _uses_memory_graph(cli_ctx):
+                graph = _load_context_graph(cli_ctx)
+                decision = next(
+                    (d for d in _memory_decisions(cli_ctx) if d["id"] == decision_id),
+                    None,
+                )
+                if decision is None:
+                    raise click.ClickException(
+                        f"No decision {decision_id!r} in "
+                        f"{_memory_graph_path(cli_ctx)}. Run 'semantica decision "
+                        f"list' to see what is recorded."
+                    )
+                result = graph.check_decision_rules(
+                    decision, rules=_load_policy_rules(rules) if rules else None
+                )
+            else:
+                from .context.decision_methods import check_decision_compliance
+                # The API expects a policy_id string; derive it from the rules file
+                # stem if provided, otherwise use the decision ID as the policy key.
+                policy_id = Path(rules).stem if rules else decision_id
+                result = check_decision_compliance(
+                    _get_graph_store(cli_ctx), decision_id, policy_id
+                )
         except ImportError as exc:
             raise click.ClickException(f"Context module not available: {exc}") from exc
         if _is_json(cli_ctx, local_json):
@@ -4192,17 +4399,25 @@ def export(
             if fmt in MULTI_FILE_FORMATS and (compress or not output):
                 raise _multi_file_destination_error(fmt, compress)
 
-            graph_db = dict(cli_ctx.config.to_dict().get("graph_db", {}))
-            backend = cli_ctx.store_backend or graph_db.pop("backend", None)
-            previous_graph_config = graph_store_config.get_all()
-            graph_store_config.update(graph_db)
-            if backend:
-                graph_store_config.set("default_backend", backend)
-            try:
-                entities = get_nodes(limit=sys.maxsize)
-                relationships = get_relationships(limit=sys.maxsize)
-            finally:
-                graph_store_config.update(previous_graph_config)
+            if _uses_memory_graph(cli_ctx):
+                # ContextGraph.to_kg_dict() already returns entities and
+                # relationships in the shape assembled below.
+                kg = _load_context_graph(cli_ctx).to_kg_dict()
+                entities = kg.get("entities", [])
+                relationships = kg.get("relationships", [])
+            else:
+                graph_db = dict(cli_ctx.config.to_dict().get("graph_db", {}))
+                graph_db.pop("path", None)
+                backend = cli_ctx.store_backend or graph_db.pop("backend", None)
+                previous_graph_config = graph_store_config.get_all()
+                graph_store_config.update(graph_db)
+                if backend:
+                    graph_store_config.set("default_backend", backend)
+                try:
+                    entities = get_nodes(limit=sys.maxsize)
+                    relationships = get_relationships(limit=sys.maxsize)
+                finally:
+                    graph_store_config.update(previous_graph_config)
 
             knowledge_graph = {
                 "entities": entities,
