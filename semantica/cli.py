@@ -12,6 +12,16 @@ import re
 import sys
 import time
 
+try:  # POSIX advisory locking
+    import fcntl
+except ImportError:  # pragma: no cover - Windows
+    fcntl = None  # type: ignore[assignment]
+
+try:  # Windows advisory locking
+    import msvcrt
+except ImportError:  # pragma: no cover - POSIX
+    msvcrt = None  # type: ignore[assignment]
+
 # Reconfigure stdout/stderr to UTF-8 on Windows before any other import
 # captures sys.stdout (Rich, Click). This prevents UnicodeEncodeError from
 # box-drawing characters and emoji on the default cp1252 code page.
@@ -195,6 +205,24 @@ def _load_config_data(file_path: Path) -> Dict[str, Any]:
     return config_data
 
 
+def default_config_path() -> Path:
+    """The config file `semantica init` writes, loaded when --config is absent."""
+    return Path.home() / ".semantica" / "config.yaml"
+
+
+def _resolve_config_path(config_path: Optional[str]) -> Optional[str]:
+    """Return the config file to load: --config, else init's file if it exists.
+
+    Without this, `semantica init` wrote ``~/.semantica/config.yaml`` and nothing
+    ever read it — so accepting its defaults still left every command using the
+    built-in fallback rather than the backend the user had just chosen (#1481).
+    """
+    if config_path:
+        return config_path
+    default = default_config_path()
+    return str(default) if default.is_file() else None
+
+
 def _build_runtime_config(
     config_path: Optional[str],
     log_level: Optional[str],
@@ -202,8 +230,9 @@ def _build_runtime_config(
     """Resolve CLI config from file plus global flag overrides."""
     config_manager = ConfigManager()
 
-    if config_path:
-        config_data = _load_config_data(Path(config_path))
+    resolved_path = _resolve_config_path(config_path)
+    if resolved_path:
+        config_data = _load_config_data(Path(resolved_path))
     else:
         config_data = {}
 
@@ -412,7 +441,7 @@ def _run_build_command(
             allow_file_fallback=False,
         )
         command_ctx = CLIContext(
-            config_path=command_config_path,
+            config_path=_resolve_config_path(command_config_path),
             config=cmd_config,
             log_level=cli_ctx.log_level,
             log_level_override=cli_ctx.log_level_override,
@@ -628,7 +657,7 @@ def main(
             global console  # noqa: PLW0603
             console = Console(no_color=True)
         ctx.obj = CLIContext(
-            config_path=config_path,
+            config_path=_resolve_config_path(config_path),
             config=config,
             log_level=effective_log_level,
             log_level_override=log_level.upper() if log_level else None,
@@ -1233,8 +1262,9 @@ def build_alias(
 MEMORY_GRAPH_BACKEND = "memory"
 _NO_RATIONALE = "(no rationale provided)"
 _LOCK_TIMEOUT_SECONDS = 10.0
-_LOCK_STALE_SECONDS = 60.0
-_DEFAULT_GRAPH_BACKEND = "neo4j"
+# `semantica init` offers memory as its default and ContextGraph serves it
+# without any server, so it is also the fallback when nothing is configured.
+_DEFAULT_GRAPH_BACKEND = MEMORY_GRAPH_BACKEND
 
 
 def _resolve_graph_backend(cli_ctx: CLIContext) -> str:
@@ -1297,8 +1327,36 @@ def _save_context_graph(cli_ctx: CLIContext, graph: Any) -> None:
     graph.save_to_file(path)
 
 
+def _try_lock_exclusive(fd: int) -> bool:
+    """Take an exclusive advisory lock on ``fd`` without blocking."""
+    if fcntl is not None:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return True
+        except OSError:
+            return False
+    if msvcrt is not None:  # pragma: no cover - Windows only
+        try:
+            os.lseek(fd, 0, os.SEEK_SET)
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+            return True
+        except OSError:
+            return False
+    # No locking primitive available: proceed rather than refuse to record.
+    return True
+
+
+def _unlock(fd: int) -> None:
+    """Release the advisory lock held on ``fd``."""
+    if fcntl is not None:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+    elif msvcrt is not None:  # pragma: no cover - Windows only
+        os.lseek(fd, 0, os.SEEK_SET)
+        msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+
+
 @contextlib.contextmanager
-def _memory_graph_lock(cli_ctx: CLIContext) -> "Iterator[None]":
+def _memory_graph_lock(cli_ctx: CLIContext) -> Iterator[None]:
     """Serialise read-modify-write of the memory graph across CLI processes.
 
     ``decision record`` loads the whole graph, adds a node and writes it back.
@@ -1306,38 +1364,33 @@ def _memory_graph_lock(cli_ctx: CLIContext) -> "Iterator[None]":
     earlier decision — ``save_to_file`` replaces the file atomically, so the
     write is never torn, but the lost update is invisible.
 
-    Uses the ``O_CREAT | O_EXCL`` atomic-create idiom already used for the
-    extraction cache, which needs no third-party dependency and behaves the
-    same on Windows. A lock older than ``_LOCK_STALE_SECONDS`` is treated as
-    abandoned by a killed process and reclaimed, so a crash cannot wedge the
-    CLI permanently.
+    Uses an OS advisory lock (``flock``, or ``msvcrt.locking`` on Windows) on a
+    sidecar ``.lock`` file. The kernel releases it when the holder exits, so
+    there is no staleness timeout to guess at and a crashed writer cannot wedge
+    the CLI. Deliberately never unlinks the file: removing it would let a
+    second process create a fresh inode and lock that instead, re-introducing
+    the double-entry this prevents — which is exactly what an mtime-based
+    "reclaim an old lock" rule does to a writer that is merely slow or
+    suspended.
     """
     lock_path = _memory_graph_path(cli_ctx).with_suffix(".lock")
     lock_path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
     deadline = time.monotonic() + _LOCK_TIMEOUT_SECONDS
-    while True:
-        try:
-            fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-            break
-        except FileExistsError:
-            try:
-                age = time.time() - lock_path.stat().st_mtime
-            except FileNotFoundError:
-                continue  # released between the open and the stat; retry
-            if age > _LOCK_STALE_SECONDS:
-                lock_path.unlink(missing_ok=True)
-                continue
+    try:
+        while not _try_lock_exclusive(fd):
             if time.monotonic() >= deadline:
                 raise click.ClickException(
-                    f"Timed out waiting for {lock_path}. If no other semantica "
-                    f"command is running, delete that file."
+                    f"Timed out waiting for another semantica command to finish "
+                    f"writing {_memory_graph_path(cli_ctx)}."
                 )
             time.sleep(0.05)
-    try:
-        yield
+        try:
+            yield
+        finally:
+            _unlock(fd)
     finally:
         os.close(fd)
-        lock_path.unlink(missing_ok=True)
 
 
 def _decision_from_node(node: Dict[str, Any]) -> Dict[str, Any]:

@@ -1702,7 +1702,9 @@ class TestDecision:
                             "semantica.context.decision_query", fake_decision_query)
         monkeypatch.setitem(__import__("sys").modules,
                             "semantica.graph_store", fake_graph_store)
-        result = runner.invoke(cli_module.main, ["decision", "list", "--format", "json"])
+        result = runner.invoke(
+            cli_module.main, ["decision", "list", "--format", "json"]
+        )
         _ok(result)
 
     # (filter, matching category, decoy category the mangled filter also hits)
@@ -1949,16 +1951,114 @@ class TestMemoryGraphBackend:
         titles = {d["scenario"] for d in cli_module._memory_decisions(ctx)}
         assert titles == {f"Decision {i}" for i in range(4)}, titles
 
-    def test_stale_lock_is_reclaimed(self, memory_cfg, tmp_path, monkeypatch):
-        """A lock left by a killed process must not wedge the CLI forever."""
-        lock = (tmp_path / "graph.json").with_suffix(".lock")
-        lock.write_text("")
-        old = time.time() - (cli_module._LOCK_STALE_SECONDS + 5)
-        os.utime(lock, (old, old))
+    def test_an_old_lock_held_by_a_live_writer_is_not_stolen(self, memory_cfg):
+        """Age must never grant entry while the holder is alive.
+
+        An mtime-based "reclaim a lock older than N" rule lets a second writer
+        into the critical section whenever the first is merely slow or
+        suspended. The second saves, the first then saves its older snapshot,
+        and the second decision disappears with no error anywhere.
+        """
+        import subprocess
+        import sys as _sys
+
+        ctx = self._ctx(memory_cfg)
+        lock = cli_module._memory_graph_path(ctx).with_suffix(".lock")
+
+        with cli_module._memory_graph_lock(ctx):
+            graph = cli_module._load_context_graph(ctx)
+            graph.record_decision(category="a", scenario="A", reasoning="r",
+                                  outcome="recorded", confidence=1.0)
+            # Make the lock look ancient while this writer still holds it.
+            lock.touch()
+            old = time.time() - 86_400
+            os.utime(lock, (old, old))
+
+            other = subprocess.run(
+                [_sys.executable, "-m", "semantica.cli", "--config", memory_cfg,
+                 "decision", "record", "--title", "B", "--tags", "b",
+                 "--rationale", "r"],
+                capture_output=True, text=True, timeout=120,
+            )
+            # B must be kept out, not allowed in to have its write erased.
+            assert other.returncode != 0, other.stdout + other.stderr
+            assert cli_module._memory_decisions(ctx) == [] or all(
+                d["scenario"] != "B" for d in cli_module._memory_decisions(ctx)
+            )
+            cli_module._save_context_graph(ctx, graph)
+
+        assert [d["scenario"] for d in cli_module._memory_decisions(ctx)] == ["A"]
+
+    def test_lock_is_released_when_the_holder_exits(self, memory_cfg):
+        """The OS drops an advisory lock on process death, so no timeout guess."""
         ctx = self._ctx(memory_cfg)
         with cli_module._memory_graph_lock(ctx):
             pass
-        assert not lock.exists()
+        with cli_module._memory_graph_lock(ctx):  # immediately re-acquirable
+            pass
+
+    def test_init_then_plain_commands_need_no_config_flag(
+        self, runner, monkeypatch, tmp_path
+    ):
+        """The workflow #1481 is actually about: init, then plain commands.
+
+        `semantica init` writes ~/.semantica/config.yaml, but nothing read it,
+        so accepting its `memory` default still left every command on the
+        built-in fallback. Supplying --config in tests hid this entirely.
+        """
+        home = tmp_path / "home"
+        home.mkdir()
+        monkeypatch.setattr(cli_module.Path, "home", staticmethod(lambda: home))
+
+        init = runner.invoke(cli_module.main, ["init"], input="memory\nfaiss\nnone\n")
+        _ok(init)
+        assert "backend: memory" in (home / ".semantica" / "config.yaml").read_text()
+
+        # No --config from here on.
+        rec = runner.invoke(cli_module.main, [
+            "decision", "record", "--title", "First", "--tags", "pilot",
+            "--rationale", "trying it out",
+        ])
+        _ok(rec)
+        listed = runner.invoke(
+            cli_module.main, ["decision", "list", "--format", "json"]
+        )
+        _ok(listed)
+        assert [d["title"] for d in json.loads(listed.output)] == ["First"]
+
+        exported = runner.invoke(cli_module.main, ["export", "--format", "json"])
+        _ok(exported)
+        assert "First" in exported.output
+
+    def test_default_backend_is_memory_with_no_config_at_all(
+        self, runner, monkeypatch, tmp_path
+    ):
+        """A user who never ran init gets a working local graph, not a Neo4j error."""
+        home = tmp_path / "empty-home"
+        home.mkdir()
+        monkeypatch.setattr(cli_module.Path, "home", staticmethod(lambda: home))
+        result = runner.invoke(
+            cli_module.main, ["decision", "list", "--format", "json"]
+        )
+        _ok(result)
+        assert json.loads(result.output) == []
+
+    def test_explicit_config_still_wins_over_the_default_file(
+        self, runner, monkeypatch, tmp_path
+    ):
+        home = tmp_path / "home2"
+        (home / ".semantica").mkdir(parents=True)
+        (home / ".semantica" / "config.yaml").write_text(
+            "graph_db:\n  backend: memory\n"
+        )
+        monkeypatch.setattr(cli_module.Path, "home", staticmethod(lambda: home))
+        explicit = tmp_path / "explicit.yaml"
+        explicit.write_text("graph_db:\n  backend: falkordb\n")
+        ctx_cfg = cli_module._build_runtime_config(str(explicit), None)
+        ctx = cli_module.CLIContext(
+            config_path=str(explicit), config=ctx_cfg, log_level="INFO"
+        )
+        assert cli_module._resolve_graph_backend(ctx) == "falkordb"
 
     def test_get_graph_store_refuses_memory_with_a_clear_message(self, memory_cfg):
         """Safety net: a future caller that forgets to route memory gets told."""
@@ -2291,7 +2391,10 @@ class TestExport:
         _patch_graph_store(monkeypatch, [STORE_RELATIONSHIP])
 
         output_path = tmp_path / "export.json"
-        result = runner.invoke(cli_module.main, ["export", "--format", "json", "--output", str(output_path)])
+        result = runner.invoke(cli_module.main, [
+            "--store", "neo4j", "export", "--format", "json",
+            "--output", str(output_path),
+        ])
         _ok(result)
         exported = output_path.read_text(encoding="utf-8")
         assert "Alice" in exported
@@ -2307,7 +2410,9 @@ class TestExport:
             (_ for _ in ()).throw(ImportError(n))
             if "semantica.export" in n else original_import(n, *a, **k)
         )):
-            result = runner.invoke(cli_module.main, ["export", "--format", "json"])
+            result = runner.invoke(
+                cli_module.main, ["--store", "neo4j", "export", "--format", "json"]
+            )
         assert result.exit_code != 0
         assert "Traceback" not in result.output
 
@@ -2328,7 +2433,8 @@ class TestExportMultiFileFormats:
         target = tmp_path / f"graph{ext}"
 
         result = runner.invoke(
-            cli_module.main, ["export", "--format", fmt, "--output", str(target)]
+            cli_module.main,
+            ["--store", "neo4j", "export", "--format", fmt, "--output", str(target)]
         )
 
         _ok(result)
@@ -2365,7 +2471,8 @@ class TestExportMultiFileFormats:
         target = tmp_path / "graph.arrow"
 
         result = runner.invoke(
-            cli_module.main, ["export", "--format", "arrow", "--output", str(target)]
+            cli_module.main,
+            ["--store", "neo4j", "export", "--format", "arrow", "--output", str(target)]
         )
 
         _ok(result)
@@ -2380,7 +2487,8 @@ class TestExportMultiFileFormats:
         target = tmp_path / f"graph{ext}"
 
         result = runner.invoke(
-            cli_module.main, ["export", "--format", fmt, "--output", str(target)]
+            cli_module.main,
+            ["--store", "neo4j", "export", "--format", fmt, "--output", str(target)]
         )
 
         _ok(result)
