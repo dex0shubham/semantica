@@ -2060,6 +2060,64 @@ class TestMemoryGraphBackend:
         )
         assert cli_module._resolve_graph_backend(ctx) == "falkordb"
 
+    @staticmethod
+    def _init_home(monkeypatch, tmp_path, name):
+        """A HOME whose ~/.semantica/config.yaml selects the memory backend."""
+        home = tmp_path / name
+        (home / ".semantica").mkdir(parents=True)
+        (home / ".semantica" / "config.yaml").write_text(
+            "graph_db:\n  backend: memory\nvector_store:\n  backend: faiss\n"
+        )
+        monkeypatch.setattr(cli_module.Path, "home", staticmethod(lambda: home))
+        return home
+
+    def test_store_override_constructs_the_real_backend(self, monkeypatch, tmp_path):
+        """--store must reach GraphStore, not die assembling its arguments.
+
+        `store_backend or graph_db.pop("backend", ...)` short-circuits, so an
+        override left the configured backend in the kwargs and GraphStore got
+        `backend` twice. Auto-loading ~/.semantica/config.yaml made plain
+        `init` + `--store` hit it, so this asserts on construction rather than
+        on _resolve_graph_backend().
+        """
+        self._init_home(monkeypatch, tmp_path, "home-override")
+        seen = {}
+
+        class FakeGraphStore:
+            def __init__(self, backend=None, **kwargs):
+                seen["backend"] = backend
+                seen["kwargs"] = kwargs
+
+        monkeypatch.setitem(
+            __import__("sys").modules, "semantica.graph_store",
+            _fake_module(GraphStore=FakeGraphStore),
+        )
+        cfg = cli_module._build_runtime_config(None, None)
+        ctx = cli_module.CLIContext(
+            config_path=None, config=cfg, log_level="INFO", store_backend="neo4j",
+        )
+        store = cli_module._get_graph_store(ctx)
+        assert isinstance(store, FakeGraphStore)
+        assert seen["backend"] == "neo4j"
+        assert "backend" not in seen["kwargs"], seen["kwargs"]
+
+    @pytest.mark.parametrize("args", [
+        ["decision", "list", "--format", "json"],
+        ["export", "--format", "json"],
+    ])
+    def test_store_override_after_init_does_not_fail_on_arguments(
+        self, runner, monkeypatch, tmp_path, args
+    ):
+        """init then `--store neo4j <cmd>` must not raise a TypeError."""
+        self._init_home(monkeypatch, tmp_path, f"home-{args[0]}")
+        result = runner.invoke(cli_module.main, ["--store", "neo4j"] + args)
+        # Rich wraps the error inside a box, so collapse whitespace before
+        # matching: the literal phrase is split across lines in result.output.
+        flat = " ".join(result.output.split())
+        assert "multiple values for keyword argument" not in flat, flat[:300]
+        assert "TypeError" not in flat, flat[:300]
+        assert "Traceback" not in result.output
+
     def test_get_graph_store_refuses_memory_with_a_clear_message(self, memory_cfg):
         """Safety net: a future caller that forgets to route memory gets told."""
         import click as _click

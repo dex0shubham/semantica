@@ -1464,7 +1464,11 @@ def _get_graph_store(cli_ctx: CLIContext) -> Any:
     cfg = cli_ctx.config.to_dict()
     graph_db = dict(cfg.get("graph_db", {}))
     graph_db.pop("path", None)
-    backend = cli_ctx.store_backend or graph_db.pop("backend", _DEFAULT_GRAPH_BACKEND)
+    # Pop unconditionally: `store_backend or graph_db.pop(...)` short-circuits,
+    # so an override left the configured backend in the kwargs and GraphStore
+    # received it twice.
+    configured = graph_db.pop("backend", None)
+    backend = cli_ctx.store_backend or configured or _DEFAULT_GRAPH_BACKEND
     if backend == MEMORY_GRAPH_BACKEND:
         # Reached only if a new caller forgets to route memory through
         # ContextGraph; GraphStore would raise "Unknown backend: memory".
@@ -4532,7 +4536,10 @@ def export(
             else:
                 graph_db = dict(cli_ctx.config.to_dict().get("graph_db", {}))
                 graph_db.pop("path", None)
-                backend = cli_ctx.store_backend or graph_db.pop("backend", None)
+                # Pop before choosing, or an override leaves the configured
+                # backend in the mapping pushed into graph_store_config.
+                configured = graph_db.pop("backend", None)
+                backend = cli_ctx.store_backend or configured
                 previous_graph_config = graph_store_config.get_all()
                 graph_store_config.update(graph_db)
                 if backend:
