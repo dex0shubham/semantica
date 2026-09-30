@@ -1737,9 +1737,13 @@ class TestDecision:
         monkeypatch.setitem(__import__("sys").modules, "semantica.graph_store",
                             _fake_module(GraphStore=MagicMock(return_value=MagicMock())))
 
+        # --store neo4j: these mock DecisionQuery/GraphStore, so they must name
+        # the database path explicitly rather than inherit the default backend,
+        # which is memory and would read an empty ContextGraph.
         result = runner.invoke(
             cli_module.main,
-            ["decision", "query", "--filter", f"tag:{tag}", "--format", "json"],
+            ["--store", "neo4j", "decision", "query", "--filter", f"tag:{tag}",
+             "--format", "json"],
         )
         _ok(result)
         ids = [d["id"] for d in json.loads(result.output)]
