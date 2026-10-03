@@ -3476,9 +3476,16 @@ def _tag_filter_value(filter_str: str) -> str:
     ``str.lstrip("tag:")`` strips any leading ``t``, ``a``, ``g`` or ``:``
     *characters*, not the prefix: ``tag:auth`` became ``uth`` and ``tag:git``
     became ``it``, so the filter silently matched the wrong text. Anything
-    without the prefix is passed through unchanged.
+    without the prefix is passed through unchanged. An empty value is rejected,
+    since ``"" in category`` is true for every decision.
     """
-    return filter_str.removeprefix("tag:").lower()
+    value = filter_str.removeprefix("tag:").lower()
+    if not value:
+        raise click.BadParameter(
+            "tag: filter requires a non-empty value, e.g. tag:finance",
+            param_hint="'--filter'",
+        )
+    return value
 
 
 @decision.command("query")
@@ -3493,6 +3500,7 @@ def decision_query(cli_ctx: CLIContext, filter_str: Optional[str],
     cli_ctx = _require_ctx(cli_ctx)
 
     def _action() -> None:
+        tag_value = _tag_filter_value(filter_str) if filter_str is not None else None
         try:
             import datetime as _dt
             since_dt = _dt.datetime.fromisoformat(since) if since else _dt.datetime.min
@@ -3509,8 +3517,7 @@ def decision_query(cli_ctx: CLIContext, filter_str: Optional[str],
                 {"id": d.decision_id, "category": d.category, "scenario": d.scenario,
                  "outcome": d.outcome, "confidence": d.confidence}
                 for d in (raw or [])
-                if filter_str is None
-                or _tag_filter_value(filter_str) in d.category.lower()
+                if tag_value is None or tag_value in d.category.lower()
             ]
         except ImportError as exc:
             raise click.ClickException(f"Context module not available: {exc}") from exc
