@@ -4940,7 +4940,13 @@ class ContextGraph:
     def _add_decision_to_graph(self, decision: Dict[str, Any]) -> None:
         """Add decision to context graph."""
         try:
-            protected_properties = {
+            # Every keyword add_node() is given explicitly below. A metadata key
+            # or **kwargs entry under one of these names would arrive twice and
+            # raise TypeError, so both mappings are filtered by the same set —
+            # the previous pair of hand-maintained lists had drifted apart and
+            # omitted valid_from/valid_until/content from the metadata filter.
+            node_properties = {
+                "content",
                 "category",
                 "scenario",
                 "reasoning",
@@ -4948,30 +4954,22 @@ class ContextGraph:
                 "confidence",
                 "timestamp",
                 "decision_maker",
+                "recorded_at",
+                "valid_from",
+                "valid_until",
             }
+            # Keys of the decision mapping handled structurally, not as node
+            # properties.
+            structural_keys = {"id", "entities", "metadata"}
             safe_metadata = {
                 key: value
                 for key, value in (decision.get("metadata") or {}).items()
-                if key not in protected_properties
+                if key not in node_properties
             }
             extra_properties = {
                 key: value
                 for key, value in decision.items()
-                if key not in {
-                    "id",
-                    "category",
-                    "scenario",
-                    "reasoning",
-                    "outcome",
-                    "confidence",
-                    "entities",
-                    "decision_maker",
-                    "timestamp",
-                    "recorded_at",
-                    "valid_from",
-                    "valid_until",
-                    "metadata",
-                }
+                if key not in node_properties and key not in structural_keys
             }
             # Add decision node
             self.add_node(
@@ -5041,8 +5039,13 @@ class ContextGraph:
                     "made_by"
                 )
             
-        except Exception as e:
+        except Exception:
+            # Do not swallow this. record_decision() has already generated the
+            # id it is about to return, so a silent failure here hands the
+            # caller a plausible identifier for a decision that is not in the
+            # graph, and surfaces only when something reads the graph back.
             self.logger.exception("Failed to add decision to graph")
+            raise
 
     def _decision_matches_temporal_filters(
         self,
