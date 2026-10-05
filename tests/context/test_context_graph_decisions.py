@@ -964,6 +964,7 @@ class TestRecordDecisionReservedKeys:
         "valid_from", "valid_until", "content", "recorded_at",
         "category", "scenario", "reasoning", "outcome", "confidence",
         "timestamp", "decision_maker",
+        "node_id", "node_type", "self",
     ])
     def test_metadata_may_shadow_any_node_property(self, graph, key):
         """A metadata key matching an add_node argument must not drop the node."""
@@ -986,13 +987,20 @@ class TestRecordDecisionReservedKeys:
         assert len(stored) == 1
         assert stored[0]["id"] == decision_id
 
-    def test_kwargs_may_shadow_a_node_property(self, graph):
+    @pytest.mark.parametrize("key", ["content", "node_id", "node_type"])
+    def test_kwargs_may_shadow_a_node_property(self, graph, key):
         """**kwargs lands in the decision mapping and was filtered separately."""
-        decision_id = self._record(graph, content="some other content")
+        decision_id = self._record(graph, **{key: "some other value"})
 
         stored = graph.get_nodes_by_label("decision")
         assert len(stored) == 1
         assert stored[0]["id"] == decision_id
+
+    def test_kwargs_cannot_replace_the_generated_id(self, graph):
+        """An "id" kwarg would make the returned id differ from the stored one."""
+        with pytest.raises(ValueError, match="reserved"):
+            self._record(graph, id="custom-id")
+        assert graph.get_nodes_by_label("decision") == []
 
     def test_a_recorded_id_is_always_present_in_the_graph(self, graph):
         """The invariant the bug violated: returned id => node exists."""
@@ -1007,3 +1015,40 @@ class TestRecordDecisionReservedKeys:
         monkeypatch.setattr(graph, "add_node", boom)
         with pytest.raises(RuntimeError, match="storage is down"):
             self._record(graph)
+
+    def test_partial_failure_leaves_no_orphans_and_retry_is_clean(self, graph, monkeypatch):
+        """A failure after the decision node is written must roll it back."""
+        real_add_edge = graph.add_edge
+        calls = {"n": 0}
+
+        def flaky_add_edge(*args, **kwargs):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError("edge store failed")
+            return real_add_edge(*args, **kwargs)
+
+        monkeypatch.setattr(graph, "add_edge", flaky_add_edge)
+        with pytest.raises(RuntimeError, match="edge store failed"):
+            self._record(graph, entities=["acme"], decision_maker="alice")
+
+        assert len(graph.nodes) == 0
+        assert len(graph.edges) == 0
+        assert graph.get_nodes_by_label("decision") == []
+
+        # The retry succeeds and is the only decision in the graph.
+        decision_id = self._record(graph, entities=["acme"], decision_maker="alice")
+        stored = graph.get_nodes_by_label("decision")
+        assert [n["id"] for n in stored] == [decision_id]
+        assert graph.find_node(decision_id) is not None
+
+    def test_rollback_keeps_pre_existing_nodes(self, graph, monkeypatch):
+        """Rollback removes only what this call created."""
+        graph.add_node("acme", "entity", name="acme")
+        monkeypatch.setattr(
+            graph, "add_edge",
+            lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")),
+        )
+        with pytest.raises(RuntimeError):
+            self._record(graph, entities=["acme"])
+
+        assert set(graph.nodes) == {"acme"}
