@@ -141,6 +141,9 @@ class TestNotebook14(unittest.TestCase):
     @patch("semantica.visualization.ontology_visualizer.go")
     def test_visualization(self, mock_go, mock_make_subplots):
         """Test OntologyVisualizer usage (mocking plotly)."""
+        # Needs the optional viz extra; skip rather than fail on a
+        # core install.
+        pytest.importorskip("plotly")
         viz = OntologyVisualizer()
         ontology = self._run_full_pipeline()
 
