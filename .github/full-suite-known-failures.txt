@@ -80,13 +80,6 @@ tests/semantic_extract/test_cache_backends.py::test_sqlite_rejects_symlinked_db 
 tests/ingest/test_ingestors.py::TestUnifiedIngest::test_ingest_web_dispatch
 tests/ingest/test_ingestors.py::TestWebIngestor::test_ingest_url
 
-# --- Local embedding backend unavailable offline ------------------------------
-# The generator-config case is the exception: on the Linux runner the model does
-# load and the test passes, so it is marked `# windows-only` rather than left to
-# a strict xfail that would fail on that pass. The rest of this group is gone:
-# #1931 restored the semantic_extract config isolation and they now pass.
-tests/test_embedding_providers.py::TestEmbeddingProviders::test_embedding_generator_config  # windows-only
-
 # --- Progress tracking is forced off for the whole process --------------------
 # `semantica_mcp/mcp/__init__.py` sets `SEMANTICA_DISABLE_PROGRESS=1` at import
 # and `tests/test_mcp_package_export_graphml_parquet.py` sets it at module scope
