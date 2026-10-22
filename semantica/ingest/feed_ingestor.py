@@ -715,6 +715,14 @@ class FeedIngestor:
         """
         feed_urls = []
 
+        # Checked before the try: the `except Exception` below returns [] on
+        # failure, which would report a missing dependency as "no feeds found".
+        if BeautifulSoup is None:
+            raise ProcessingError(
+                "HTML parsing requires 'beautifulsoup4'. "
+                "Install it with: pip install 'semantica[documents]'"
+            )
+
         try:
             # Fetch website content
             response = request_with_ssrf_guard(
@@ -726,11 +734,6 @@ class FeedIngestor:
             response.raise_for_status()
 
             # Parse HTML
-            if BeautifulSoup is None:
-                raise ProcessingError(
-                    "HTML parsing requires 'beautifulsoup4'. "
-                    "Install it with: pip install 'semantica[documents]'"
-                )
             soup = BeautifulSoup(response.text, "html.parser")
 
             # Look for feed links
