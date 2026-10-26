@@ -389,12 +389,15 @@ class EmailParser:
 
         # Extract from HTML if available
         if email_content.strip().startswith("<"):
+            # Checked before the try: the `except Exception: pass` below would
+            # suppress this and fall back to the regex scan, which misses
+            # relative URLs and href-only links, with no hint to the caller.
+            if BeautifulSoup is None:
+                raise ProcessingError(
+                    "HTML parsing requires 'beautifulsoup4'. "
+                    "Install it with: pip install 'semantica[documents]'"
+                )
             try:
-                if BeautifulSoup is None:
-                    raise ProcessingError(
-                        "HTML parsing requires 'beautifulsoup4'. "
-                        "Install it with: pip install 'semantica[documents]'"
-                    )
                 soup = BeautifulSoup(email_content, "html.parser")
                 for link_tag in soup.find_all("a", href=True):
                     links.append(link_tag["href"])
