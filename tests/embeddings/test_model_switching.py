@@ -122,3 +122,42 @@ class TestModelSwitching(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class TestFallbackReporting(unittest.TestCase):
+    """get_model_info must not name a model that is not loaded.
+
+    Model loading degrades to hash embedding without raising (documented on
+    _initialize_model), so a caller's only signal is what get_model_info
+    reports. Reporting the requested name while `method` is "fallback" made the
+    two fields contradict each other, and the docstring promises model_name is
+    the model "actually in use".
+    """
+
+    def test_fallback_does_not_report_the_requested_model_as_in_use(self):
+        embedder = TextEmbedder()
+        with patch(
+            "semantica.embeddings.text_embedder.FASTEMBED_AVAILABLE", False
+        ):
+            embedder.set_model("fastembed", "BAAI/bge-small-en-v1.5")
+
+        info = embedder.get_model_info()
+        self.assertEqual(info["method"], "fallback")
+        self.assertFalse(info["model_loaded"])
+        self.assertNotEqual(
+            info["model_name"],
+            "BAAI/bge-small-en-v1.5",
+            "model_name named a model that was never loaded",
+        )
+        self.assertEqual(info["requested_model_name"], "BAAI/bge-small-en-v1.5")
+
+    def test_requested_name_is_preserved_for_diagnostics(self):
+        embedder = TextEmbedder()
+        with patch(
+            "semantica.embeddings.text_embedder.FASTEMBED_AVAILABLE", False
+        ):
+            embedder.set_model("fastembed", "some/model")
+
+        self.assertEqual(
+            embedder.get_model_info()["requested_model_name"], "some/model"
+        )
