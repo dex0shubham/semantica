@@ -506,6 +506,18 @@ class TextEmbedder:
         else:
             return "fallback"
 
+    def _requested_model_name(self) -> str:
+        """The model name the loader attempted, including for a failed load.
+
+        FastEmbed takes its name from the ``fastembed_model_name`` config
+        override when one is set (see ``_initialize_model``), so reporting
+        ``self.model_name`` would name a different model from the one that was
+        actually requested.
+        """
+        if self.method == "fastembed":
+            return self.config.get("fastembed_model_name", self.model_name)
+        return self.model_name
+
     def get_model_info(self) -> Dict[str, Any]:
         """
         Get detailed information about the active embedding model.
@@ -545,7 +557,7 @@ class TextEmbedder:
             # `model_name="BAAI/bge-small-en-v1.5"` reads as success to anything
             # that inspects the name.
             "model_name": self.model_name if method != "fallback" else "fallback",
-            "requested_model_name": self.model_name,
+            "requested_model_name": self._requested_model_name(),
             "model_loaded": model_loaded,
             "dimension": self.get_embedding_dimension(),
             "normalize": self.normalize,
